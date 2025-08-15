@@ -1,0 +1,8 @@
+# n8n
+.n8n/
+.env
+*.log
+
+# system
+.DS_Store
+__pycache__/
