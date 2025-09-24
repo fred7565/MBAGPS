@@ -1,0 +1,663 @@
+{
+  "name": "Marketing GP",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "6ef4535e-812b-423a-9f47-7683b8baba96",
+      "name": "Start"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c9019524-9728-4790-9d31-1b4eb0c1879c",
+              "name": "site_theme",
+              "value": "Custom Handmade Oil Painting",
+              "type": "string"
+            },
+            {
+              "id": "df74d16c-80f8-4769-84ef-6e85eecd31e3",
+              "name": "number_of_topics",
+              "value": 2,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "id": "692c8171-9e7e-4dee-b5ba-c5c33b00a6b3",
+      "name": "Input"
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "keywords",
+          "mode": "list",
+          "cachedResultName": "keywords"
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        440,
+        0
+      ],
+      "id": "e722986e-ed3f-493e-b157-127588d61797",
+      "name": "Keywords",
+      "credentials": {
+        "postgres": {
+          "id": "<to-be-configured-locally>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "topics",
+          "mode": "list",
+          "cachedResultName": "topics"
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        660,
+        0
+      ],
+      "id": "988c9036-0a38-425d-9ead-c41b1879ffcb",
+      "name": "Topics",
+      "credentials": {
+        "postgres": {
+          "id": "<to-be-configured-locally>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$env.GROQ_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\nJSON.stringify({\n  model: \"llama-3.1-8b-instant\",\n  temperature: 0.7,\n  max_tokens: 1200,\n  messages: [\n    {\n      role: \"system\",\n      content: \"You are an expert Chinese SEO editor. Only output valid JSON.\"\n    },\n    {\n      role: \"user\",\n      content: `你是一名资深英文 SEO 编辑与信息架构师。请严格输出 JSON 数组，每个元素是一个对象；生成新的、不与已有重复的 topics 和 5 条 outlines。如果已有的为空，就直接生成新的，按照下面的要求生成。要求英语，英语！数量严格按照要求！！！\n\n站点主题：${$items(\"Input\")[0].json.site_theme}\n需要输出的主题数量按照这个来执行：${$items(\"Input\")[0].json.number_of_topics}\n\n关键词（请自然选取1个主要+若干次要，避免堆砌）：\n${$items(\"Keywords\").map(i => i.json.keyword).slice(0, 50).join(\", \")}\n\n已有的标题（避免重复/同质化）：\n${$items(\"Topics\").map(i => i.json.title).slice(0, 80).join(\"; \")}\n\n输出格式（严格 JSON 数组）：\n- 每个对象包含：\n  \"title\": string,\n \n  \"outline\": string[]（精确 5 条）,\n  \n- 约束：\n  - 标题 ≤ 68 个英文字符，自然包含主要关键词\n  - outline 要具有实用性或者能引起读者兴趣\n  - 主题必须与上面的“已有标题”不重复或高度同质\n只输出 JSON 数组，不要任何解释文字。`\n    }\n  ]\n})\n}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "id": "263ab65f-696f-465f-9459-ab2cca1e03d7",
+      "name": "Titles&Outlines Generation",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Robust parser for Groq titles+outlines\n * - Guarantees exactly `want` items\n * - Each item has exactly 5 outlines (auto pad)\n * - Dedupe with existing topics (soft similarity) + unique slug\n */\n\n// ---------- helpers ----------\nfunction normalize(s){ return (s||\"\").toLowerCase().replace(/[\\W_]+/g,\" \").trim(); }\nfunction slugify(s){ return (s||\"\").toLowerCase().replace(/[\\W_]+/g,\"-\").replace(/^-+|-+$/g,\"\"); }\n\nfunction jaccardLike(a,b){\n  if(!a||!b) return 0;\n  const A=new Set(normalize(a).split(\" \").filter(Boolean));\n  const B=new Set(normalize(b).split(\" \").filter(Boolean));\n  if(A.size===0 || B.size===0) return 0;\n  let inter=0; A.forEach(x=>{ if(B.has(x)) inter++; });\n  const union = new Set([...A, ...B]).size || 1;\n  return inter/union;\n}\nfunction softSim(a,b){\n  const j = jaccardLike(a,b);\n  const lr = Math.min((a||\"\").length,(b||\"\").length) / Math.max((a||\"\").length,(b||\"\").length || 1);\n  return 0.65*j + 0.35*lr;  // 0~1\n}\n\nfunction padTo5(title, arr){\n  const base = (arr||[]).map(x=>String(x||\"\").trim()).filter(Boolean).slice(0,5);\n  const need = 5 - base.length;\n  if(need<=0) return base.slice(0,5);\n  // 简单规则补齐（可按需替换成更个性化的模板）\n  const t = title || \"This topic\";\n  const fillers = [\n    `Key considerations for ${t.toLowerCase()}`,\n    `Practical steps to get started with ${t.toLowerCase()}`,\n    `Common mistakes to avoid in ${t.toLowerCase()}`,\n    `Real-world examples and takeaways for ${t.toLowerCase()}`,\n    `FAQ: what readers often ask about ${t.toLowerCase()}`\n  ];\n  for(let i=0;i<need;i++) base.push(fillers[i % fillers.length]);\n  return base.slice(0,5);\n}\n\n/** 从文本中提取第一段 JSON 数组 */\nfunction extractJSONArray(text){\n  if(!text) return null;\n  let s = String(text).trim();\n\n  // 去掉 ```json ... ``` 或 ``` 包裹\n  s = s.replace(/^```(?:json|javascript)?/i, \"\").replace(/```$/,\"\").trim();\n\n  // 直接尝试 JSON.parse\n  try { const v = JSON.parse(s); if(Array.isArray(v)) return v; } catch(_){}\n\n  // 宽松：定位首个 '[' 与最后一个 ']' 之间子串\n  const l = s.indexOf('[');\n  const r = s.lastIndexOf(']');\n  if(l>=0 && r>l){\n    const mid = s.slice(l, r+1);\n    try { const v = JSON.parse(mid); if(Array.isArray(v)) return v; } catch(_){}\n  }\n\n  // 宽松：把单引号转双引号再试（风险较小，兜底用）\n  try { const v = JSON.parse(s.replace(/'/g,'\"')); if(Array.isArray(v)) return v; } catch(_){}\n\n  return null;\n}\n\n// ---------- inputs ----------\nconst want = Number($items(\"Input\")[0]?.json?.number_of_topics || 2);\nconst existingTitles = $items(\"Topics\").map(i => i.json.title).filter(Boolean);\nconst existingNorm   = new Set(existingTitles.map(normalize));\n\nconst httpOut  = $items(\"Titles&Outlines Generation\")[0]?.json;\nconst content  = httpOut?.choices?.[0]?.message?.content;\nif(!content) throw new Error(\"Groq response missing choices[0].message.content\");\n\nlet arr = extractJSONArray(content);\nif(!arr) throw new Error(\"Cannot parse JSON array from LLM output.\");\n\n// 统一字段名 & 清洗\narr = arr\n  .map(o => {\n    const title = String(o?.title || \"\").trim();\n    const outlines = Array.isArray(o?.outlines) ? o.outlines :\n                     Array.isArray(o?.outline)  ? o.outline  : [];\n    return { title, outlines: outlines.map(x=>String(x||\"\").trim()).filter(Boolean) };\n  })\n  .filter(o => o.title); // 至少要有标题\n\n// ---------- 组装逻辑：严格 -> 放宽 -> 最终补满 ----------\nconst picked = [];\nconst usedSlug = new Set();\n\n// 近似去重（严格版）\nfunction passStrict(o){\n  const tNorm = normalize(o.title);\n  if (existingNorm.has(tNorm)) return false;\n  if (existingTitles.some(t => softSim(t, o.title) >= 0.82)) return false;\n  if (picked.some(p => softSim(p.title, o.title) >= 0.82)) return false;\n  return true;\n}\n// 放宽去重（最后兜底）\nfunction passLoose(o){\n  if (picked.some(p => normalize(p.title) === normalize(o.title))) return false;\n  return true;\n}\n\n// 生成唯一 slug\nfunction uniqSlug(baseTitle){\n  let slug = slugify(baseTitle) || \"topic\";\n  const base = slug;\n  let k = 2;\n  while(usedSlug.has(slug)) slug = `${base}-${k++}`;\n  usedSlug.add(slug);\n  return slug;\n}\n\n// 一次入篮的工具\nfunction pushItem(o){\n  picked.push({\n    title: o.title,\n    outlines: padTo5(o.title, o.outlines),\n    slug: uniqSlug(o.title),\n  });\n}\n\n// Round 1: 先挑 ≥5 条 outline 的，严格去重\nfor(const o of arr){\n  if(picked.length >= want) break;\n  if(o.outlines.length >= 5 && passStrict(o)) pushItem(o);\n}\n\n// Round 2: 再挑 ≥3 条（补齐到 5），严格去重\nif(picked.length < want){\n  for(const o of arr){\n    if(picked.length >= want) break;\n    if(o.outlines.length >= 3 && passStrict(o)) pushItem(o);\n  }\n}\n\n// Round 3: 再挑 ≥1 条（补齐到 5），严格去重\nif(picked.length < want){\n  for(const o of arr){\n    if(picked.length >= want) break;\n    if(o.outlines.length >= 1 && passStrict(o)) pushItem(o);\n  }\n}\n\n// Round 4: 还不够就放宽（仅防完全重复标题），补满 want\nif(picked.length < want){\n  for(const o of arr){\n    if(picked.length >= want) break;\n    if(passLoose(o)) pushItem(o);\n  }\n}\n\n// 截断，只要 want 个\nconst final = picked.slice(0, want);\n\n// 输出为 n8n 期望的 items 结构\nreturn final.map(x => ({ json: { title: x.title, outlines: x.outlines } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ],
+      "id": "72bc6342-19a9-4a4d-aad1-2b9702872503",
+      "name": "Parse",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "topics",
+          "mode": "list",
+          "cachedResultName": "topics"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "title": "={{ $json.title }}",
+            "outlines": "={{ $json.outlines }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "outlines",
+              "displayName": "outlines",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "array",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "content_path",
+              "displayName": "content_path",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "image_path",
+              "displayName": "image_path",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1320,
+        0
+      ],
+      "id": "07ca380e-278e-4c6c-aec9-711c8728f544",
+      "name": "Save",
+      "credentials": {
+        "postgres": {
+          "id": "<to-be-configured-locally>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1540,
+        0
+      ],
+      "id": "04b73461-f627-4fab-857f-c22da346b1d9",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === 0) 可选：你的循环节点名字（如果不同，改成相同名字；取不到也不会报错）\nconst LOOP_NODE = \"Loop Over Items\";\n\n// === 1) 取 Groq HTTP 的 HTML（当前 Code 输入）\nconst html = items[0].json?.choices?.[0]?.message?.content || \"\";\nif (!html || typeof html !== \"string\") {\n  throw new Error(\"No HTML content from Groq.\");\n}\n\n// === 2) 从 HTML 抽取 <h1> 作为标题（去标签/压空白）\nconst h1 = html.match(/<h1[^>]*>([\\s\\S]*?)<\\/h1>/i);\nconst titleFromHtml = h1 ? h1[1].replace(/<[^>]+>/g, \" \").replace(/\\s+/g, \" \").trim() : \"\";\n\n// === 3) 抽取首段作为 excerpt（<article> 内的第一个 <p>）\nconst p = html.match(/<article[\\s\\S]*?<p>([\\s\\S]*?)<\\/p>/i);\nconst firstPara = p ? p[1].replace(/<[^>]+>/g, \" \").replace(/\\s+/g, \" \").trim() : \"\";\n\n// === 4) 回退：如果没抽到 <h1>，再尝试从 Loop Over Items 取 title/id（不中断）\nlet fallbackTitle = \"\";\nlet fallbackId = null;\ntry {\n  // Code 节点里，按官方方式用：$items(\"节点名\", runIndex, $itemIndex)\n  const cur = $items(LOOP_NODE, 0, $itemIndex)?.json;\n  if (cur) {\n    fallbackTitle = cur.title || \"\";\n    fallbackId = cur.id ?? null;\n  }\n} catch (e) { /* 忽略 */ }\n\n// === 5) 最终输出\nconst finalTitle = titleFromHtml || fallbackTitle || \"Untitled\";\nconst finalId = fallbackId ?? $json.id ?? null;\n\nreturn [{\n  json: {\n    id: finalId,                          // 便于后面回写数据库\n    title: finalTitle,                    // 给 WP 的 Title\n    content_html: html.trim(),            // 给 WP 的 Content\n    excerpt: firstPara.slice(0, 300)      // 给 WP 的 Excerpt\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        100
+      ],
+      "id": "8be1d69b-9881-44ab-a707-9a54b5256d18",
+      "name": "Parse 2"
+    },
+    {
+      "parameters": {
+        "title": "={{$json.title}}",
+        "additionalFields": {
+          "content": "={{ $json.content_html }}",
+          "status": "publish"
+        }
+      },
+      "type": "n8n-nodes-base.wordpress",
+      "typeVersion": 1,
+      "position": [
+        2400,
+        100
+      ],
+      "id": "09e4c07f-c870-403b-8662-19e4f502376c",
+      "name": "Wordpress",
+      "credentials": {
+        "wordpressApi": {
+          "id": "<to-be-configured-locally>",
+          "name": "Wordpress account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "topics",
+          "mode": "list",
+          "cachedResultName": "topics"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "publish",
+            "title": "={{ $json.title.rendered }}"
+          },
+          "matchingColumns": [
+            "title"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "outlines",
+              "displayName": "outlines",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "array",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "content_path",
+              "displayName": "content_path",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "image_path",
+              "displayName": "image_path",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2620,
+        100
+      ],
+      "id": "c48d0187-d746-4c49-a0a6-23ff3575dbde",
+      "name": "Update",
+      "credentials": {
+        "postgres": {
+          "id": "<to-be-configured-locally>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "{{$env.TELEGRAM_CHAT_ID}}",
+        "text": "={{\n\"🎉✨✅ Blog generation and publishing have been successfully completed! 📝🔥\\n\\n👏👏 Congratulations on the new content going live! 🚀💯\"\n}}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1980,
+        -100
+      ],
+      "id": "146a4938-0121-49db-b403-400c50288e8f",
+      "name": "Telegram",
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "<to-be-configured-locally>",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 10
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1980,
+        100
+      ],
+      "id": "ef2c8dd1-8266-4361-b32b-d0ac944e8b8d",
+      "name": "Wait"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$env.GROQ_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\nJSON.stringify({\n  model: \"llama-3.1-8b-instant\",\n  temperature: 0.65,\n  max_tokens: 3500,\n  messages: [\n    {\n      role: \"system\",\n      content: \"You are an expert English SEO content writer and information architect.\"\n    },\n    {\n      role: \"user\",\n      content: `Write a long-form, SEO-friendly English blog post for WordPress using the inputs below. \n1.\tThe total word count in English must exceed 2,500 words.\n2.\tThe content under each subheading must align with the corresponding outline.\n3.\tDo not use bullet points! The article must be written in the most natural, continuous language possible.\n4.\tGenerate the corresponding schema data (structured data) to help search engines understand the content.\n5.\tGenerate the corresponding meta description.\n6.\tEach subheading’s content must be no fewer than 350 words.\n\n\nReturn ONLY a valid HTML fragment that can be pasted into the post body (no <html> or <head>), and include one JSON-LD <script> for structured data at the end.\n\n== INPUTS ==\nSite theme: ${$items(\"Input\")[0].json.site_theme}\nTitle: ${$json.title}\nOutline (5 bullets): ${($json.outlines || []).join(\" | \")}\nReference keywords (use naturally, never stuff): ${$items(\"Keywords\").map(i => i.json.keyword).slice(0,30).join(\", \")}\n\n== REQUIRED OUTPUT FORMAT ==\n<article>\n  <h1>Use the given title exactly once</h1>\n  <!-- The first paragraph (120–160 words) must read like a meta description: concise, value-focused, answer intent. -->\n  <p>...</p>\n  <!-- Build sections that follow the outline with <h2>/<h3>, paragraphs <p>, and lists <ul>/<ol>. -->\n \n \n</article>\n\n<!-- JSON-LD structured data: BlogPosting (schema.org). \n     Fill real values based on the article you wrote.\n     Required: @context, @type, headline, description (use or adapt the first paragraph),\n     datePublished (ISO-8601), author (name), keywords (comma-separated, concise),\n     articleSection (use site theme or main category), mainEntityOfPage (dummy URL ok if unknown),\n     publisher (name). -->\n<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"BlogPosting\",\n  \"headline\": \"${$json.title}\",\n  \"description\": \"\", \n  \"datePublished\": \"${new Date().toISOString()}\",\n  \"author\": { \"@type\": \"Person\", \"name\": \"Editorial Team\" },\n  \"keywords\": \"\",\n  \"articleSection\": \"${$items(\"Input\")[0].json.site_theme}\",\n  \"mainEntityOfPage\": { \"@type\": \"WebPage\", \"@id\": \"https://example.com/\" },\n  \"publisher\": { \"@type\": \"Organization\", \"name\": \"Your Site\" }\n}\n</script>\n\n== WRITING RULES ==\n- Natural language; DO NOT keyword-stuff. Use reference keywords only where they fit naturally.\n- Keep headings descriptive and scannable. \n- Make paragraphs short; use lists where helpful.\n- The first paragraph should be 120–160 words and can serve as the meta description.\n- No scripts other than the one JSON-LD; no tracking code; no external CSS.\n`\n    }\n  ]\n})\n}}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1760,
+        100
+      ],
+      "id": "ff4dd478-dddf-4a2f-b674-0f5cf0f2f005",
+      "name": "Blog Generation and Review",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input": {
+      "main": [
+        [
+          {
+            "node": "Keywords",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keywords": {
+      "main": [
+        [
+          {
+            "node": "Topics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Topics": {
+      "main": [
+        [
+          {
+            "node": "Titles&Outlines Generation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Titles&Outlines Generation": {
+      "main": [
+        [
+          {
+            "node": "Parse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse": {
+      "main": [
+        [
+          {
+            "node": "Save",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Blog Generation and Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse 2": {
+      "main": [
+        [
+          {
+            "node": "Wordpress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wordpress": {
+      "main": [
+        [
+          {
+            "node": "Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Parse 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Blog Generation and Review": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "6fb9b5bd-abc5-490b-9aa1-0465c83963f9",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "<redacted>"
+  },
+  "id": "QvwsjHs25l4anF98",
+  "tags": []
+}

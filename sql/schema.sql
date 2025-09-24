@@ -5,11 +5,13 @@ CREATE TABLE keywords (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE blog_posts (
+
+CREATE TABLE topics (
     id SERIAL PRIMARY KEY,
-    keyword TEXT NOT NULL,
+    title TEXT NOT NULL,
+    outlines TEXT[] DEFAULT ARRAY[]::TEXT[],
+    status VARCHAR(20) DEFAULT 'draft',
     content_path TEXT,
     image_path TEXT,
-    status VARCHAR(20) DEFAULT 'draft',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
